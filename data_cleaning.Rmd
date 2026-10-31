@@ -1,0 +1,89 @@
+# ============================================================
+# HMDA + Census Data Cleaning (R)
+# ------------------------------------------------------------
+# This script:
+#   1. Pulls tract-level rent-burden data from Census ACS via tidycensus
+#   2. Reads and cleans the HMDA CSV you downloaded manually from
+#      https://ffiec.cfpb.gov/data-browser/
+#   3. Joins them on census tract
+#   4. Exports one clean CSV for the Python modeling step
+#
+# Before running, install packages (one time only):
+#   install.packages(c("tidycensus", "tidyverse", "janitor"))
+#
+# You also need a free Census API key (same one you already got):
+#   https://api.census.gov/data/key_signup.html
+# ============================================================
+
+library(tidycensus)
+library(tidyverse)
+library(janitor)
+
+# ---------------- CONFIG - edit these ----------------
+census_api_key("e2fa3c793c7dd3f60624c5e45710133f62509952", install = FALSE)
+STATE <- "IL"                          # two-letter state code
+HMDA_FILE <- "actions_taken_1-3_state_IL.csv"  # path to the file you downloaded manually
+OUTPUT_FILE <- "hmda_census_cleaned.csv"
+# -------------------------------------------------------
+
+
+# ---- Step 1: Pull tract-level rent burden data ----
+# B25070_001 = total renter households
+# B25070_010 = renters paying 50%+ of income on rent (severely burdened)
+# B19013_001 = median household income
+census_raw <- get_acs(
+  geography = "tract",
+  variables = c(
+    total_renters = "B25070_001",
+    severely_burdened = "B25070_010",
+    median_income = "B19013_001"
+  ),
+  state = STATE,
+  year = 2022,          # latest ACS 5-year estimate at time of writing
+  output = "wide"
+)
+
+census_clean <- census_raw %>%
+  clean_names() %>%
+  transmute(
+    geoid = geoid,
+    rent_burden_pct = (severely_burdened_e / total_renters_e) * 100,
+    median_household_income = median_income_e
+  ) %>%
+  filter(!is.na(rent_burden_pct))   # drop tracts with no renter data
+
+cat("Pulled", nrow(census_clean), "census tracts.\n")
+
+
+# ---- Step 2: Read and clean the HMDA CSV ----
+hmda_raw <- read_csv(HMDA_FILE, guess_max = 100000) %>%
+  clean_names()   # converts column names to snake_case, e.g. "Census Tract" -> census_tract
+
+# Basic cleaning: drop rows with missing tract, standardize the tract ID
+# to an 11-digit zero-padded string so it matches the census GEOID format
+hmda_clean <- hmda_raw %>%
+  filter(!is.na(census_tract)) %>%
+  mutate(
+    census_tract = str_pad(as.character(census_tract), width = 11, pad = "0"),
+    # Standardize the target variable: 1 = approved, 0 = denied
+    approved = if_else(action_taken == 1, 1, 0)
+  ) %>%
+  # Drop obvious placeholder/invalid codes some HMDA fields use (e.g. 9999)
+  filter(income < 9999 | is.na(income))
+
+cat("Cleaned", nrow(hmda_clean), "HMDA records.\n")
+
+
+# ---- Step 3: Join on census tract ----
+final <- hmda_clean %>%
+  left_join(census_clean, by = c("census_tract" = "geoid"))
+
+match_rate <- mean(!is.na(final$rent_burden_pct))
+cat(sprintf("Joined %.1f%% of HMDA records to a census tract.\n", match_rate * 100))
+
+
+# ---- Step 4: Export for Python ----
+write_csv(final, OUTPUT_FILE)
+cat("Saved cleaned + joined dataset to", OUTPUT_FILE, "\n")
+
+colnames(hmda_raw)
